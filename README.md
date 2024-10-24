@@ -2,3 +2,4 @@
 This is the repo for UIT-DSC competition
 
 # Guild
+## Set up
