@@ -185,17 +185,18 @@ def generate_visual_embeds(image_file_names, images_path, cfg_path):
     model = get_model(cfg)
 
     bgr_images = convert_to_BGR(image_file_names, images_path)
-    
-    visual_embeds = []
-    for image in tqdm(bgr_images):
+        
+    visual_embeds = {}
+    for filename in tqdm(image_file_names):
+        images = convert_to_BGR([filename], images_path)
         # Convert Image to Model Input
-        image, batched_inputs = prepare_image_inputs(cfg, [image], model)
+        images, batched_inputs = prepare_image_inputs(cfg, images, model)
 
         # Get ResNet+FPN features
-        features = get_features(model, image)
+        features = get_features(model, images)
 
         # Get region proposals from RPN
-        proposals = get_proposals(model, image, features)
+        proposals = get_proposals(model, images, features)
         
         # Get Box Features for the proposals
         box_features, features_list = get_box_features(model, features, proposals)
@@ -221,6 +222,6 @@ def generate_visual_embeds(image_file_names, images_path, cfg_path):
 
         # Get the visual embedding
         visual_embed = [torch.tensor(get_visual_embeds(box_feature, keep_box)).to(device) for box_feature, keep_box in zip(box_features, keep_boxes)]
-        visual_embeds.append(visual_embed[0])
+        visual_embeds[filename] = visual_embed[0]
 
-        return visual_embeds
+    return visual_embeds

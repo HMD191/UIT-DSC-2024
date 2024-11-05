@@ -1,19 +1,13 @@
 import numpy as np
 import pandas as pd
-import pickle
 
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader, random_split
-from torch.nn.functional import softmax
-from torchmetrics.functional import f1, accuracy
+from torch.utils.data import Dataset, DataLoader
 
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 from pytorch_lightning.loggers import TensorBoardLogger
-
-import seaborn as sns
-import matplotlib.pyplot as plt
 
 from tqdm.auto import tqdm
 
@@ -21,32 +15,48 @@ from transformers import BertTokenizer, AdamW, get_linear_schedule_with_warmup
 from transformers import VisualBertModel, VisualBertConfig
 
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report, multilabel_confusion_matrix, f1_score
+from sklearn.metrics import f1_score
 
 from visual_embeds import *
 from utils import *
 
-RANDOM_SEED = 42
-MAX_LEN = 64
-N_CLASSES = 2
-N_EPOCHS = 10
-BATCH_SIZE = 32
-
-np.random.seed(RANDOM_SEED)
-torch.manual_seed(RANDOM_SEED)
-pl.seed_everything(RANDOM_SEED)
+def set_seed(seed):
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    pl.seed_everything(seed)
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+set_seed(42)
 
+class Config:
+   def __init__(self, random_seed = 42, max_len = 400, n_epochs = 2, batch_size = 8, learning_rate=2.5e-5, n_warmup_steps=400, warmup_ratio=0.05,
+                visual_embedding_dim=1024, visual_model_name = 'uclanlp/visualbert-vqa-coco-pre',
+                classes = ['not-sarcasm', 'text-sarcasm', 'image-sarcasm', 'multi-sarcasm']):
+       self.random_seed = random_seed
+       self.max_len = max_len
+       self.n_classes = len(classes)
+       self.classes = classes
+       self.n_epochs = n_epochs
+       self.batch_size = batch_size
+       self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+       self.n_warmup_steps = n_warmup_steps
+       self.learning_rate = learning_rate
+       self.warmup_ratio = warmup_ratio
+       self.visual_embedding_dim = visual_embedding_dim
+       self.visual_model_name = visual_model_name
 
 class MemesDataset(Dataset):
     '''Wrap the tokenization process in a PyTorch Dataset, along with converting the labels to tensors'''
-    
-    def __init__(self, data: pd.DataFrame, tokenizer: BertTokenizer, max_len: int, visual_embeds):
+    def __init__(self, data: pd.DataFrame, tokenizer: BertTokenizer, config: Config, visual_embeds):
         self.tokenizer = tokenizer
         self.data = data
-        self.max_len = max_len
+        self.max_len = config.max_len
         self.visual_embeds = visual_embeds
+        self.classes = config.classes
+
+        # One-hot encode the labels
+        for class_name in self.classes:
+            self.data[class_name] = self.data['label'].apply(lambda x: 1 if x == class_name else 0)
     
     def __len__(self):
         return len(self.data)
@@ -54,8 +64,8 @@ class MemesDataset(Dataset):
     def __getitem__(self, index):
 
         data_row = self.data.iloc[index]
-        text = data_row.text
-        labels = data_row.misogynous
+        text = data_row.caption
+        labels = data_row[self.classes].values.astype(int)
 
         tokens = self.tokenizer.encode_plus(
             text,
@@ -68,8 +78,8 @@ class MemesDataset(Dataset):
             return_tensors='pt',
         )
 
-        input_ids = torch.tensor(tokens["input_ids"]).flatten()
-        attention_mask = torch.tensor(tokens["attention_mask"]).flatten()
+        input_ids = tokens["input_ids"].flatten()
+        attention_mask = tokens["attention_mask"].flatten()
 
         visual_embedding = self.visual_embeds[index].to('cpu')
         visual_attention_mask = torch.ones(visual_embedding.shape[:-1], dtype=torch.float)
@@ -84,61 +94,17 @@ class MemesDataset(Dataset):
             labels=torch.tensor(labels).float()
         )
 
-
-class MemesDataModule(pl.LightningDataModule):
-    '''
-    1- Split the dataset into training and validation dataset
-    2- Create Dataloaders from Datasets (Divide data into batches)
-    '''
-
-    def __init__(self, df, tokenizer, visual_embeds, batch_size=32, max_len=64):
-        super().__init__()
-        self.batch_size = batch_size
-        self.df = df
-        self.tokenizer = tokenizer
-        self.max_len = max_len
-        self.visual_embeds = visual_embeds
-  
-    def setup(self, stage=None):
-        self.dataset = MemesDataset(self.df, self.tokenizer, self.max_len, self.visual_embeds)
-        self.train_dataset, self.val_dataset = train_test_split(self.dataset, test_size=0.1) # Split the dataset into training and validation datasets
-  
-    def train_dataloader(self):
-        return DataLoader(
-            self.train_dataset,
-            batch_size = self.batch_size,
-            shuffle=True,
-            num_workers=3
-        )
-  
-    def val_dataloader(self):
-        return DataLoader(
-            self.val_dataset,
-            batch_size = self.batch_size,
-            num_workers=3
-        )
-  
-    def test_dataloader(self):
-        return DataLoader(
-            self.val_dataset,
-            batch_size = self.batch_size,
-            num_workers=3
-        )
-
-
 class MemesClassifier(pl.LightningModule):
   '''Wrap the training of VisualBERT model to classify memes'''
 
-  def __init__(self, n_classes, n_training_steps=None, n_warmup_steps=None):
+  def __init__(self, config: Config):
     super().__init__()
-    self.configuration = VisualBertConfig.from_pretrained('uclanlp/visualbert-vqa-coco-pre', visual_embedding_dim=1024)
+    self.configuration = VisualBertConfig.from_pretrained(config.visual_model_name, visual_embedding_dim=config.visual_embedding_dim)
     self.model = VisualBertModel(self.configuration)
-    self.n_training_steps = n_training_steps
-    self.n_warmup_steps = n_warmup_steps
+    self.n_warmup_steps = config.n_warmup_steps
     self.criterion = nn.CrossEntropyLoss()
     self.dropout = nn.Dropout(0.2)
-    self.classifier = nn.Linear(self.model.config.hidden_size, n_classes)
-  
+    self.classifier = nn.Linear(self.model.config.hidden_size, config.n_classes)
   
   def forward(self, input_ids, attention_mask, visual_embeds, visual_attention_mask, visual_token_type_ids, labels=None):
     output = self.model(input_ids=input_ids,
@@ -151,11 +117,7 @@ class MemesClassifier(pl.LightningModule):
     output = self.dropout(output.pooler_output)
     output = self.classifier(output)
 
-    loss = 0
-    if labels is not None:
-      loss = self.criterion(output, labels)
-
-    return loss, output
+    return output
   
   def training_step(self, batch, batch_idx):
     input_ids = batch['input_ids'].to(device)
@@ -166,7 +128,8 @@ class MemesClassifier(pl.LightningModule):
 
     labels = batch['labels'].type(torch.LongTensor).to(device)
     
-    loss, outputs = self(input_ids, attention_mask, visual_embeds, visual_attention_mask, visual_token_type_ids, labels)
+    outputs = self(input_ids, attention_mask, visual_embeds, visual_attention_mask, visual_token_type_ids, labels)
+    loss = self.criterion(outputs, labels)
     self.log('train_loss', loss, prog_bar=True, logger=True)
 
     return {"loss":loss, 'predictions':outputs, 'labels':labels}
@@ -179,7 +142,8 @@ class MemesClassifier(pl.LightningModule):
     visual_token_type_ids = batch['visual_token_type_ids'].to(device)
     labels = batch['labels'].type(torch.LongTensor).to(device)
     
-    loss, outputs = self(input_ids, attention_mask, visual_embeds, visual_attention_mask, visual_token_type_ids, labels)
+    outputs = self(input_ids, attention_mask, visual_embeds, visual_attention_mask, visual_token_type_ids, labels)
+    loss = self.criterion(outputs, labels)
     self.log('val_loss', loss, prog_bar=True, logger=True)
 
     return loss
@@ -202,7 +166,7 @@ class MemesClassifier(pl.LightningModule):
     )
 
 
-def train_model(model, df, tokenizer, visual_embeds):
+def train_model(model, train_df, val_df, tokenizer, config, visual_embeds):
     checkpoint_callback = ModelCheckpoint(
         dirpath="checkpoints",
         filename="best-checkpoint",
@@ -215,60 +179,75 @@ def train_model(model, df, tokenizer, visual_embeds):
     logger = TensorBoardLogger("lightning_logs", name="memes-text")
     early_stopping_callback = EarlyStopping(monitor='val_loss', patience=3)
 
-    data_module = MemesDataModule(
-        df=df,
-        tokenizer=tokenizer,
-        visual_embeds=visual_embeds,
-        batch_size=BATCH_SIZE,
-        max_len=MAX_LEN
-    )
-
     trainer = pl.Trainer(
         logger=logger,
         callbacks=[early_stopping_callback, checkpoint_callback],
-        max_epochs=N_EPOCHS,
-        gpus=1,
-        progress_bar_refresh_rate=10
+        max_epochs=config.n_epochs,
+        accelerator='auto',
+        enable_progress_bar=True,
     )
 
-    trainer.fit(model, data_module)
+    train_dataset = MemesDataset(
+        train_df, 
+        tokenizer, 
+        config,
+        visual_embeds=visual_embeds
+    )
 
+    val_dataset = MemesDataset(
+        val_df, 
+        tokenizer, 
+        config,
+        visual_embeds=visual_embeds
+    )
 
-def evaluate_model(test_dataset, checkpoint):
+    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=config.batch_size)
+
+    trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
+
+def evaluate_model(test_df, checkpoint, tokenizer, config, visual_embeds):
+    test_dataset = MemesDataset(
+        test_df, 
+        tokenizer, 
+        config,
+        visual_embeds=visual_embeds
+    )
+
     trained_model = MemesClassifier.load_from_checkpoint(
         checkpoint,
-        n_classes=2
+        n_classes=config.n_classes,
     ).to(device)
 
     trained_model.eval()
-    trained_model.freeze()
 
     predictions = []
     labels = []
     for item in tqdm(test_dataset):
-        _, prediction = trained_model(
-            item["input_ids"].unsqueeze(dim=0).to(device),
-            item["attention_mask"].unsqueeze(dim=0).to(device),
-            item["visual_embedding"].unsqueeze(dim=0).to(device),
-            item['visual_attention_mask'].unsqueeze(dim=0).to(device),
-            item['visual_token_type_ids'].unsqueeze(dim=0).to(device)
-        )
+        with torch.no_grad():
+            _, prediction = trained_model(
+                item["input_ids"].unsqueeze(dim=0).to(device),
+                item["attention_mask"].unsqueeze(dim=0).to(device),
+                item["visual_embedding"].unsqueeze(dim=0).to(device),
+                item['visual_attention_mask'].unsqueeze(dim=0).to(device),
+                item['visual_token_type_ids'].unsqueeze(dim=0).to(device)
+            )
         predictions.append(prediction.flatten())
-        labels.append(item["labels"].int())
+        labels.append(item["labels"])
     
     predictions = torch.stack(predictions).detach().cpu()
     labels = torch.stack(labels).detach().cpu()
 
     _, preds = torch.max(torch.tensor(predictions), dim=1)
+    _, labels = torch.max(labels, dim=1)
     
     f1_macro = f1_score(labels, preds , average="macro")
     f1_micro = f1_score(labels, preds , average="micro")
     accuracy = accuracy(predictions, labels)
 
     return f1_macro, f1_micro, accuracy
-    
 
-def main(): 
+def main():
     df = pd.read_csv('./Data/your_training.csv')
     df.text = np.array([preprocess_text(text) for text in df.text])
 
